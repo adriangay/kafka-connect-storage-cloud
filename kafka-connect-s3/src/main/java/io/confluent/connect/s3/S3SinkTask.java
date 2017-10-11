@@ -35,6 +35,8 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
+import io.confluent.common.utils.SystemTime;
+import io.confluent.common.utils.Time;
 import io.confluent.connect.s3.storage.S3Storage;
 import io.confluent.connect.s3.util.Version;
 import io.confluent.connect.storage.StorageFactory;
@@ -55,6 +57,7 @@ public class S3SinkTask extends SinkTask {
   private Partitioner<FieldSchema> partitioner;
   private Format<S3SinkConnectorConfig, String> format;
   private RecordWriterProvider<S3SinkConnectorConfig> writerProvider;
+  private final Time time;
 
   /**
    * No-arg constructor. Used by Connect framework.
@@ -63,17 +66,21 @@ public class S3SinkTask extends SinkTask {
     // no-arg constructor required by Connect framework.
     assignment = new HashSet<>();
     topicPartitionWriters = new HashMap<>();
+    time = new SystemTime();
   }
 
   // visible for testing.
   S3SinkTask(S3SinkConnectorConfig connectorConfig, SinkTaskContext context, S3Storage storage,
-             Partitioner<FieldSchema> partitioner, Format<S3SinkConnectorConfig, String> format) throws Exception {
-    this();
+             Partitioner<FieldSchema> partitioner, Format<S3SinkConnectorConfig, String> format,
+             Time time) throws Exception {
+    this.assignment = new HashSet<>();
+    this.topicPartitionWriters = new HashMap<>();
     this.connectorConfig = connectorConfig;
     this.context = context;
     this.storage = storage;
     this.partitioner = partitioner;
     this.format = format;
+    this.time = time;
 
     url = connectorConfig.getString(StorageCommonConfig.STORE_URL_CONFIG);
     writerProvider = this.format.getRecordWriterProvider();
@@ -91,7 +98,12 @@ public class S3SinkTask extends SinkTask {
       Class<? extends S3Storage> storageClass =
           (Class<? extends S3Storage>)
               connectorConfig.getClass(StorageCommonConfig.STORAGE_CLASS_CONFIG);
-      storage = StorageFactory.createStorage(storageClass, S3SinkConnectorConfig.class, connectorConfig, url);
+      storage = StorageFactory.createStorage(
+          storageClass,
+          S3SinkConnectorConfig.class,
+          connectorConfig,
+          url
+      );
       if (!storage.bucketExists()) {
         throw new DataException("No-existent S3 bucket: " + connectorConfig.getBucketName());
       }
@@ -101,8 +113,8 @@ public class S3SinkTask extends SinkTask {
 
       open(context.assignment());
       log.info("Started S3 connector task with assigned partitions: {}", assignment);
-    } catch (ClassNotFoundException | IllegalAccessException | InstantiationException | InvocationTargetException
-                 | NoSuchMethodException e) {
+    } catch (ClassNotFoundException | IllegalAccessException | InstantiationException
+        | InvocationTargetException | NoSuchMethodException e) {
       throw new ConnectException("Reflection exception: ", e);
     } catch (AmazonClientException e) {
       throw new ConnectException(e);
@@ -116,21 +128,30 @@ public class S3SinkTask extends SinkTask {
 
   @Override
   public void open(Collection<TopicPartition> partitions) {
-    // assignment should be empty, either because this is the initial call or because it follows a call to "close".
+    // assignment should be empty, either because this is the initial call or because it follows
+    // a call to "close".
     assignment.addAll(partitions);
     for (TopicPartition tp : assignment) {
-      TopicPartitionWriter writer =
-          new TopicPartitionWriter(tp, storage, writerProvider, partitioner, connectorConfig, context);
+      TopicPartitionWriter writer = new TopicPartitionWriter(
+          tp,
+          writerProvider,
+          partitioner,
+          connectorConfig,
+          context,
+          time
+      );
       topicPartitionWriters.put(tp, writer);
     }
   }
 
   @SuppressWarnings("unchecked")
-  private Format<S3SinkConnectorConfig, String> newFormat() throws ClassNotFoundException, IllegalAccessException,
-                                                                   InstantiationException, InvocationTargetException,
-                                                                   NoSuchMethodException {
+  private Format<S3SinkConnectorConfig, String> newFormat()
+      throws ClassNotFoundException, IllegalAccessException, InstantiationException,
+             InvocationTargetException, NoSuchMethodException {
     Class<Format<S3SinkConnectorConfig, String>> formatClass =
-        (Class<Format<S3SinkConnectorConfig, String>>) connectorConfig.getClass(S3SinkConnectorConfig.FORMAT_CLASS_CONFIG);
+        (Class<Format<S3SinkConnectorConfig, String>>) connectorConfig.getClass(
+            S3SinkConnectorConfig.FORMAT_CLASS_CONFIG
+        );
     return formatClass.getConstructor(S3Storage.class).newInstance(storage);
   }
 
@@ -148,7 +169,8 @@ public class S3SinkTask extends SinkTask {
     Map<String, ?> originals = config.originals();
     for (String originalKey : originals.keySet()) {
       if (!plainValues.containsKey(originalKey)) {
-        // pass any additional configs down to the partitioner so that custom partitioners can have their own configs
+        // pass any additional configs down to the partitioner so that custom partitioners can
+        // have their own configs
         plainValues.put(originalKey, originals.get(originalKey));
       }
     }
@@ -180,7 +202,9 @@ public class S3SinkTask extends SinkTask {
   }
 
   @Override
-  public Map<TopicPartition, OffsetAndMetadata> preCommit(Map<TopicPartition, OffsetAndMetadata> offsets) {
+  public Map<TopicPartition, OffsetAndMetadata> preCommit(
+      Map<TopicPartition, OffsetAndMetadata> offsets
+  ) {
     Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
     for (TopicPartition tp : assignment) {
       Long offset = topicPartitionWriters.get(tp).getOffsetToCommitAndReset();

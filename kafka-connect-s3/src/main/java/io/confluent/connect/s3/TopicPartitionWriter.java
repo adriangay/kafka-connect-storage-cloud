@@ -18,7 +18,6 @@ package io.confluent.connect.s3;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.IllegalWorkerStateException;
@@ -36,6 +35,8 @@ import java.util.LinkedList;
 import java.util.Map;
 import java.util.Queue;
 
+import io.confluent.common.utils.SystemTime;
+import io.confluent.common.utils.Time;
 import io.confluent.connect.s3.storage.S3Storage;
 import io.confluent.connect.storage.common.StorageCommonConfig;
 import io.confluent.connect.storage.format.RecordWriter;
@@ -71,7 +72,6 @@ public class TopicPartitionWriter {
   private String currentEncodedPartition;
   private Long baseRecordTimestamp;
   private Long offsetToCommit;
-  private Long nextOffsetToCommit;
   private final RecordWriterProvider<S3SinkConnectorConfig> writerProvider;
   private final Map<String, Long> startOffsets;
   private long timeoutMs;
@@ -84,6 +84,7 @@ public class TopicPartitionWriter {
   private final Time time;
   private DateTimeZone timeZone;
   private final S3SinkConnectorConfig connectorConfig;
+  private static final Time SYSTEM_TIME = new SystemTime();
 
   public TopicPartitionWriter(TopicPartition tp,
                               S3Storage storage,
@@ -91,7 +92,7 @@ public class TopicPartitionWriter {
                               Partitioner<FieldSchema> partitioner,
                               S3SinkConnectorConfig connectorConfig,
                               SinkTaskContext context) {
-    this(tp, writerProvider, partitioner, connectorConfig, context, Time.SYSTEM);
+    this(tp, writerProvider, partitioner, connectorConfig, context, SYSTEM_TIME);
   }
 
   // Visible for testing
@@ -115,7 +116,7 @@ public class TopicPartitionWriter {
     rotateIntervalMs = connectorConfig.getLong(S3SinkConnectorConfig.ROTATE_INTERVAL_MS_CONFIG);
     rotateScheduleIntervalMs =
         connectorConfig.getLong(S3SinkConnectorConfig.ROTATE_SCHEDULE_INTERVAL_MS_CONFIG);
-    if(rotateScheduleIntervalMs > 0) {
+    if (rotateScheduleIntervalMs > 0) {
       timeZone = DateTimeZone.forID(connectorConfig.getString(PartitionerConfig.TIMEZONE_CONFIG));
     }
     timeoutMs = connectorConfig.getLong(S3SinkConnectorConfig.RETRY_BACKOFF_CONFIG);
@@ -154,7 +155,6 @@ public class TopicPartitionWriter {
     }
   }
 
-  @SuppressWarnings("fallthrough")
   public void write() {
     long now = time.milliseconds();
     if (failureTime > 0 && now - failureTime < timeoutMs) {
@@ -163,57 +163,7 @@ public class TopicPartitionWriter {
 
     while (!buffer.isEmpty()) {
       try {
-        switch (state) {
-          case WRITE_STARTED:
-            pause();
-            nextState();
-          case WRITE_PARTITION_PAUSED:
-            SinkRecord record = buffer.peek();
-            if (timestampExtractor != null) {
-              currentTimestamp = timestampExtractor.extract(record);
-              if (baseRecordTimestamp == null) {
-                baseRecordTimestamp = currentTimestamp;
-              }
-            }
-            Schema valueSchema = record.valueSchema();
-            String encodedPartition = partitioner.encodePartition(record);
-            Schema currentValueSchema = currentSchemas.get(encodedPartition);
-            if (currentValueSchema == null) {
-              currentSchemas.put(encodedPartition, valueSchema);
-              currentValueSchema = valueSchema;
-            }
-
-            if (compatibility.shouldChangeSchema(record, null, currentValueSchema) && recordCount > 0) {
-              // This branch is never true for the first record read by this TopicPartitionWriter
-              currentSchemas.put(encodedPartition, valueSchema);
-              nextOffsetToCommit = currentOffset;
-              nextState();
-            } else if (rotateOnTime(encodedPartition, currentTimestamp, now)) {
-              nextOffsetToCommit = currentOffset;
-              nextState();
-            } else {
-              currentEncodedPartition = encodedPartition;
-              SinkRecord projectedRecord = compatibility.project(record, null, currentValueSchema);
-              writeRecord(projectedRecord);
-              buffer.poll();
-              if (rotateOnSize()) {
-                log.info("Starting commit and rotation for topic partition {} with start offset {}", tp, startOffsets);
-                nextOffsetToCommit = currentOffset + 1;
-                nextState();
-                // Fall through and try to rotate immediately
-              } else {
-                break;
-              }
-            }
-          case SHOULD_ROTATE:
-            commitFiles();
-            nextState();
-          case FILE_COMMITTED:
-            setState(State.WRITE_PARTITION_PAUSED);
-            break;
-          default:
-            log.error("{} is not a valid state to write record for topic partition {}.", state, tp);
-        }
+        executeState(now);
       } catch (SchemaProjectorException | IllegalWorkerStateException e) {
         throw new ConnectException(e);
       } catch (RetriableException e) {
@@ -223,10 +173,113 @@ public class TopicPartitionWriter {
         break;
       }
     }
+    commitOnTimeIfNoData(now);
+  }
+
+  @SuppressWarnings("fallthrough")
+  private void executeState(long now) {
+    switch (state) {
+      case WRITE_STARTED:
+        pause();
+        nextState();
+        // fallthrough
+      case WRITE_PARTITION_PAUSED:
+        SinkRecord record = buffer.peek();
+        if (timestampExtractor != null) {
+          currentTimestamp = timestampExtractor.extract(record);
+          if (baseRecordTimestamp == null) {
+            baseRecordTimestamp = currentTimestamp;
+          }
+        }
+        Schema valueSchema = record.valueSchema();
+        String encodedPartition = partitioner.encodePartition(record);
+        Schema currentValueSchema = currentSchemas.get(encodedPartition);
+        if (currentValueSchema == null) {
+          currentSchemas.put(encodedPartition, valueSchema);
+          currentValueSchema = valueSchema;
+        }
+
+        if (!checkRotationOrAppend(
+            record,
+            currentValueSchema,
+            valueSchema,
+            encodedPartition,
+            now
+        )) {
+          break;
+        }
+        // fallthrough
+      case SHOULD_ROTATE:
+        commitFiles();
+        nextState();
+        // fallthrough
+      case FILE_COMMITTED:
+        setState(State.WRITE_PARTITION_PAUSED);
+        break;
+      default:
+        log.error("{} is not a valid state to write record for topic partition {}.", state, tp);
+    }
+  }
+
+  /**
+   * Check if we should rotate the file (schema change, time-based).
+   * @returns true if rotation is being performed, false otherwise
+   */
+  private boolean checkRotationOrAppend(
+      SinkRecord record,
+      Schema currentValueSchema,
+      Schema valueSchema,
+      String encodedPartition,
+      long now
+  ) {
+    if (compatibility.shouldChangeSchema(record, null, currentValueSchema)
+        && recordCount > 0) {
+      // This branch is never true for the first record read by this TopicPartitionWriter
+      log.trace(
+          "Incompatible change of schema detected for record '{}' with encoded partition "
+          + "'{}' and current offset: '{}'",
+          record,
+          encodedPartition,
+          currentOffset
+      );
+      currentSchemas.put(encodedPartition, valueSchema);
+      nextState();
+    } else if (rotateOnTime(encodedPartition, currentTimestamp, now)) {
+      setNextScheduledRotation();
+      nextState();
+    } else {
+      currentEncodedPartition = encodedPartition;
+      SinkRecord projectedRecord = compatibility.project(
+          record,
+          null,
+          currentValueSchema
+      );
+      writeRecord(projectedRecord);
+      buffer.poll();
+      if (rotateOnSize()) {
+        log.info(
+            "Starting commit and rotation for topic partition {} with start offset {}",
+            tp,
+            startOffsets
+        );
+        nextState();
+        // Fall through and try to rotate immediately
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private void commitOnTimeIfNoData(long now) {
     if (buffer.isEmpty()) {
-      // committing files after waiting for rotateIntervalMs time but less than flush.size records available
+      // committing files after waiting for rotateIntervalMs time but less than flush.size
+      // records available
       if (recordCount > 0 && rotateOnTime(currentEncodedPartition, currentTimestamp, now)) {
-        log.info("committing files after waiting for rotateIntervalMs time but less than flush.size records available.");
+        log.info(
+            "Committing files after waiting for rotateIntervalMs time but less than flush.size "
+            + "records available."
+        );
         setNextScheduledRotation();
 
         try {
@@ -286,11 +339,15 @@ public class TopicPartitionWriter {
     );
 
     log.trace(
-        "Should apply periodic time-based rotation: (recordCount: {}, rotateIntervalMs: {}, "
-            + "encodedPartition: {}, baseRecordTimestamp: {}, timestamp: {})? {}",
+        "Checking rotation on time with recordCount '{}' and encodedPartition '{}'",
         recordCount,
+        encodedPartition
+    );
+
+    log.trace(
+        "Should apply periodic time-based rotation (rotateIntervalMs: '{}', baseRecordTimestamp: "
+            + "'{}', timestamp: '{}')? {}",
         rotateIntervalMs,
-        encodedPartition,
         baseRecordTimestamp,
         recordTimestamp,
         periodicRotation
@@ -298,18 +355,17 @@ public class TopicPartitionWriter {
 
     boolean scheduledRotation = rotateScheduleIntervalMs > 0 && now >= nextScheduledRotation;
     log.trace(
-        "Should apply scheduled rotation: (recordCount: {}, rotateScheduleIntervalMs: {}, "
-            + "nextScheduledRotation: {}, baseRecordTimestamp: {}, timestamp: {})? {}",
-        recordCount,
+        "Should apply scheduled rotation: (rotateScheduleIntervalMs: '{}', nextScheduledRotation:"
+            + " '{}', now: '{}')? {}",
         rotateScheduleIntervalMs,
         nextScheduledRotation,
-        encodedPartition,
-        periodicRotation
+        now,
+        scheduledRotation
     );
     return periodicRotation || scheduledRotation;
   }
 
-  private void setNextScheduledRotation () {
+  private void setNextScheduledRotation() {
     if (rotateScheduleIntervalMs > 0) {
       long now = time.milliseconds();
       nextScheduledRotation = DateTimeUtils.getNextTimeAdjustedByDay(
@@ -329,8 +385,12 @@ public class TopicPartitionWriter {
 
   private boolean rotateOnSize() {
     boolean messageSizeRotation = recordCount >= flushSize;
-    log.trace("Should apply size-based rotation (count {} >= flush size {})? {}", recordCount, flushSize,
-              messageSizeRotation);
+    log.trace(
+        "Should apply size-based rotation (count {} >= flush size {})? {}",
+        recordCount,
+        flushSize,
+        messageSizeRotation
+    );
     return messageSizeRotation;
   }
 
@@ -344,11 +404,17 @@ public class TopicPartitionWriter {
     context.resume(tp);
   }
 
-  private RecordWriter getWriter(SinkRecord record, String encodedPartition) throws ConnectException {
+  private RecordWriter getWriter(SinkRecord record, String encodedPartition)
+      throws ConnectException {
     if (writers.containsKey(encodedPartition)) {
       return writers.get(encodedPartition);
     }
     String commitFilename = getCommitFilename(encodedPartition);
+    log.debug(
+        "Creating new writer encodedPartition='{}' filename='{}'",
+        encodedPartition,
+        commitFilename
+    );
     RecordWriter writer = writerProvider.getRecordWriter(connectorConfig, commitFilename);
     writers.put(encodedPartition, writer);
     return writer;
@@ -385,7 +451,11 @@ public class TopicPartitionWriter {
     currentOffset = record.kafkaOffset();
 
     if (!startOffsets.containsKey(currentEncodedPartition)) {
-      log.trace("Setting writer's start offset for '{}' to {}", currentEncodedPartition, currentOffset);
+      log.trace(
+          "Setting writer's start offset for '{}' to {}",
+          currentEncodedPartition,
+          currentOffset
+      );
       startOffsets.put(currentEncodedPartition, currentOffset);
     }
 
@@ -399,7 +469,7 @@ public class TopicPartitionWriter {
       commitFile(entry.getKey());
       log.debug("Committed {} for {}", entry.getValue(), tp);
     }
-    offsetToCommit = nextOffsetToCommit;
+    offsetToCommit = currentOffset + 1;
     commitFiles.clear();
     currentSchemas.clear();
     recordCount = 0;

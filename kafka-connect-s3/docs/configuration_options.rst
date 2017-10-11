@@ -18,6 +18,20 @@ Connector
   * Type: int
   * Importance: high
 
+``rotate.interval.ms``
+  The time interval in milliseconds to invoke file commits. This configuration ensures that file commits are invoked every configured interval. This configuration is useful when data ingestion rate is low and the connector didn't write enough messages to commit files. The default value -1 means that this feature is disabled.
+
+  * Type: long
+  * Default: -1
+  * Importance: high
+
+``rotate.schedule.interval.ms``
+  The time interval in milliseconds to periodically invoke file commits. This configuration ensures that file commits are invoked every configured interval. Time of commit will be adjusted to 00:00 of selected timezone. Commit will be performed at scheduled time regardless previous commit time or number of messages. This configuration is useful when you have to commit your data based on current server time, like at the beginning of every hour. The default value -1 means that this feature is disabled.
+
+  * Type: long
+  * Default: -1
+  * Importance: medium
+
 ``schema.cache.size``
   The size of the schema cache used in the Avro converter.
 
@@ -87,6 +101,13 @@ S3
   * Default: false
   * Importance: medium
 
+``avro.codec``
+  The Avro compression codec to be used for output files. Available values: null, deflate, snappy and bzip2 (codec source is org.apache.avro.file.CodecFactory)
+
+  * Type: string
+  * Default: null
+  * Importance: low
+
 Storage
 ^^^^^^^
 
@@ -133,7 +154,13 @@ Partitioner
   * Type: class
   * Default: io.confluent.connect.storage.partitioner.DefaultPartitioner
   * Importance: high
-  * Dependents: ``partition.field.name``, ``partition.duration.ms``, ``path.format``, ``locale``, ``timezone``
+  * Dependents: ``partition.field.name``, ``partition.duration.ms``, ``path.format``, ``locale``, ``timezone``, ``schema.generator.class``
+
+``schema.generator.class``
+  The schema generator to use with partitioners.
+
+  * Type: class
+  * Importance: high
 
 ``partition.field.name``
   The name of the partitioning field when FieldPartitioner is used.

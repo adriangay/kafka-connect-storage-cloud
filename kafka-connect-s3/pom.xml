@@ -24,7 +24,7 @@
     <parent>
         <groupId>io.confluent</groupId>
         <artifactId>kafka-connect-storage-cloud</artifactId>
-        <version>3.2.2</version>
+        <version>4.1.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>kafka-connect-s3</artifactId>
@@ -141,6 +141,9 @@
         </profile>
         <profile>
             <id>licenses-package</id>
+            <activation>
+                <activeByDefault>false</activeByDefault>
+            </activation>
             <build>
                 <plugins>
                     <plugin>
@@ -197,8 +200,11 @@
                 </plugins>
             </build>
         </profile>
-            <profile>
+        <profile>
             <id>licenses-source</id>
+            <activation>
+                <activeByDefault>false</activeByDefault>
+            </activation>
             <build>
                 <plugins>
                     <plugin>

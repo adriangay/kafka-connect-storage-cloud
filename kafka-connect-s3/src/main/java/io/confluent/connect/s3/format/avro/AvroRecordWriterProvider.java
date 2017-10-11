@@ -16,6 +16,7 @@
 
 package io.confluent.connect.s3.format.avro;
 
+import org.apache.avro.file.CodecFactory;
 import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.kafka.connect.data.Schema;
@@ -66,6 +67,7 @@ public class AvroRecordWriterProvider implements RecordWriterProvider<S3SinkConn
             log.info("Opening record writer for: {}", filename);
             s3out = storage.create(filename, true);
             org.apache.avro.Schema avroSchema = avroData.fromConnectSchema(schema);
+            writer.setCodec(CodecFactory.fromString(conf.getAvroCodec()));
             writer.create(avroSchema, s3out);
           } catch (IOException e) {
             throw new ConnectException(e);
@@ -83,8 +85,8 @@ public class AvroRecordWriterProvider implements RecordWriterProvider<S3SinkConn
       @Override
       public void commit() {
         try {
-          // Flush is required here, because closing the writer will close the underlying S3 output stream before
-          // committing any data to S3.
+          // Flush is required here, because closing the writer will close the underlying S3
+          // output stream before committing any data to S3.
           writer.flush();
           s3out.commit();
           writer.close();

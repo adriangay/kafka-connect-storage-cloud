@@ -18,12 +18,14 @@ package io.confluent.connect.s3;
 
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.model.S3ObjectSummary;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import io.confluent.connect.s3.format.bytearray.ByteArrayFormat;
+import io.confluent.connect.s3.storage.S3Storage;
+import io.confluent.connect.s3.util.FileUtils;
+import io.confluent.connect.storage.partitioner.DefaultPartitioner;
+import io.confluent.connect.storage.partitioner.Partitioner;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.Struct;
-import org.apache.kafka.connect.json.JsonConverter;
+import org.apache.kafka.connect.converters.ByteArrayConverter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.After;
 import org.junit.Test;
@@ -37,28 +39,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import io.confluent.connect.s3.format.json.JsonFormat;
-import io.confluent.connect.s3.storage.S3Storage;
-import io.confluent.connect.s3.util.FileUtils;
-import io.confluent.connect.storage.partitioner.DefaultPartitioner;
-import io.confluent.connect.storage.partitioner.Partitioner;
-
 import static org.hamcrest.CoreMatchers.is;
-import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
-public class DataWriterJsonTest extends TestWithMockedS3 {
+public class DataWriterByteArrayTest extends TestWithMockedS3 {
 
   private static final String ZERO_PAD_FMT = "%010d";
-  private JsonConverter converter;
+  private ByteArrayConverter converter;
 
-  private final String extension = ".json";
-  protected final ObjectMapper mapper = new ObjectMapper();
   protected S3Storage storage;
   protected AmazonS3 s3;
   protected Partitioner<FieldSchema> partitioner;
-  protected JsonFormat format;
+  protected ByteArrayFormat format;
   protected S3SinkTask task;
   protected Map<String, String> localProps = new HashMap<>();
 
@@ -72,15 +66,14 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
   //@Before should be omitted in order to be able to add properties per test.
   public void setUp() throws Exception {
     super.setUp();
-    converter = new JsonConverter();
-    converter.configure(Collections.singletonMap("schemas.enable", "false"), false);
+    converter = new ByteArrayConverter();
 
     s3 = newS3Client(connectorConfig);
     storage = new S3Storage(connectorConfig, url, S3_TEST_BUCKET_NAME, s3);
 
     partitioner = new DefaultPartitioner<>();
     partitioner.configure(parsedConfig);
-    format = new JsonFormat(storage);
+    format = new ByteArrayFormat(storage);
     s3.createBucket(S3_TEST_BUCKET_NAME);
     assertTrue(s3.doesBucketExist(S3_TEST_BUCKET_NAME));
   }
@@ -93,60 +86,46 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
   }
 
   @Test
-  public void testWithSchema() throws Exception {
-    localProps.put(S3SinkConnectorConfig.FORMAT_CLASS_CONFIG, JsonFormat.class.getName());
+  public void testNoSchema() throws Exception {
+    localProps.put(S3SinkConnectorConfig.FORMAT_CLASS_CONFIG, ByteArrayFormat.class.getName());
     setUp();
     task = new S3SinkTask(connectorConfig, context, storage, partitioner, format, SYSTEM_TIME);
 
-    List<SinkRecord> sinkRecords = createRecordsInterleaved(7 * context.assignment().size(), 0, context.assignment());
+    List<SinkRecord> sinkRecords = createByteArrayRecordsWithoutSchema(7 * context.assignment().size(), 0, context.assignment());
     task.put(sinkRecords);
     task.close(context.assignment());
     task.stop();
 
     long[] validOffsets = {0, 3, 6};
-    verify(sinkRecords, validOffsets, context.assignment());
+    verify(sinkRecords, validOffsets, context.assignment(), ".bin");
   }
 
   @Test
-  public void testNoSchema() throws Exception {
-    localProps.put(S3SinkConnectorConfig.FORMAT_CLASS_CONFIG, JsonFormat.class.getName());
+  public void testCustomExtensionAndLineSeparator() throws Exception {
+    String extension = ".SEPARATORjson";
+    localProps.put(S3SinkConnectorConfig.FORMAT_CLASS_CONFIG, ByteArrayFormat.class.getName());
+    localProps.put(S3SinkConnectorConfig.FORMAT_BYTEARRAY_LINE_SEPARATOR_CONFIG, "SEPARATOR");
+    localProps.put(S3SinkConnectorConfig.FORMAT_BYTEARRAY_EXTENSION_CONFIG, extension);
     setUp();
     task = new S3SinkTask(connectorConfig, context, storage, partitioner, format, SYSTEM_TIME);
 
-    List<SinkRecord> sinkRecords = createJsonRecordsWithoutSchema(7 * context.assignment().size(), 0, context.assignment());
+    List<SinkRecord> sinkRecords = createByteArrayRecordsWithoutSchema(7 * context.assignment().size(), 0, context.assignment());
     task.put(sinkRecords);
     task.close(context.assignment());
     task.stop();
 
     long[] validOffsets = {0, 3, 6};
-    verify(sinkRecords, validOffsets, context.assignment());
+    verify(sinkRecords, validOffsets, context.assignment(), extension);
   }
 
-  protected List<SinkRecord> createRecordsInterleaved(int size, long startOffset, Set<TopicPartition> partitions) {
-    String key = "key";
-    Schema schema = createSchema();
-    Struct record = createRecord(schema);
-
-    List<SinkRecord> sinkRecords = new ArrayList<>();
-    for (long offset = startOffset, total = 0; total < size; ++offset) {
-      for (TopicPartition tp : partitions) {
-        sinkRecords.add(new SinkRecord(TOPIC, tp.partition(), Schema.STRING_SCHEMA, key, schema, record, offset));
-        if (++total >= size) {
-          break;
-        }
-      }
-    }
-    return sinkRecords;
-  }
-
-  protected List<SinkRecord> createJsonRecordsWithoutSchema(int size, long startOffset, Set<TopicPartition> partitions) {
+  protected List<SinkRecord> createByteArrayRecordsWithoutSchema(int size, long startOffset, Set<TopicPartition> partitions) {
     String key = "key";
     int ibase = 12;
 
     List<SinkRecord> sinkRecords = new ArrayList<>();
     for (long offset = startOffset, total = 0; total < size; ++offset) {
       for (TopicPartition tp : partitions) {
-        String record = "{\"schema\":{\"type\":\"struct\",\"fields\":[ " +
+        byte[] record = ("{\"schema\":{\"type\":\"struct\",\"fields\":[ " +
                             "{\"type\":\"boolean\",\"optional\":true,\"field\":\"booleanField\"}," +
                             "{\"type\":\"int32\",\"optional\":true,\"field\":\"intField\"}," +
                             "{\"type\":\"int64\",\"optional\":true,\"field\":\"longField\"}," +
@@ -156,7 +135,7 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
                             "\"intField\":" + String.valueOf(ibase) + "," +
                             "\"longField\":" + String.valueOf((long) ibase) + "," +
                             "\"stringField\":str" + String.valueOf(ibase) +
-                            "}}";
+                            "}}").getBytes();
         sinkRecords.add(new SinkRecord(TOPIC, tp.partition(), null, key, null, record, offset));
         if (++total >= size) {
           break;
@@ -171,7 +150,7 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
     return partitioner.generatePartitionedPath(topic, encodedPartition);
   }
 
-  protected List<String> getExpectedFiles(long[] validOffsets, TopicPartition tp) {
+  protected List<String> getExpectedFiles(long[] validOffsets, TopicPartition tp, String extension) {
     List<String> expectedFiles = new ArrayList<>();
     for (int i = 1; i < validOffsets.length; ++i) {
       long startOffset = validOffsets[i - 1];
@@ -181,10 +160,10 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
     return expectedFiles;
   }
 
-  protected void verifyFileListing(long[] validOffsets, Set<TopicPartition> partitions) throws IOException {
+  protected void verifyFileListing(long[] validOffsets, Set<TopicPartition> partitions, String extension) throws IOException {
     List<String> expectedFiles = new ArrayList<>();
     for (TopicPartition tp : partitions) {
-      expectedFiles.addAll(getExpectedFiles(validOffsets, tp));
+      expectedFiles.addAll(getExpectedFiles(validOffsets, tp, extension));
     }
     verifyFileListing(expectedFiles);
   }
@@ -204,20 +183,17 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
 
   protected void verifyContents(List<SinkRecord> expectedRecords, int startIndex, Collection<Object> records)
       throws IOException{
-    for (Object jsonRecord : records) {
+    for (Object record : records) {
+      byte[] bytes = (byte[]) record;
       SinkRecord expectedRecord = expectedRecords.get(startIndex++);
-      Object expectedValue = expectedRecord.value();
-      if (expectedValue instanceof Struct) {
-        byte[] expectedBytes = converter.fromConnectData(TOPIC, expectedRecord.valueSchema(), expectedRecord.value());
-        expectedValue = mapper.readValue(expectedBytes, Object.class);
-      }
-      assertEquals(expectedValue, jsonRecord);
+      byte[] expectedBytes = (byte[]) expectedRecord.value();
+      assertArrayEquals(expectedBytes, bytes);
     }
   }
 
-  protected void verify(List<SinkRecord> sinkRecords, long[] validOffsets, Set<TopicPartition> partitions)
-      throws IOException {
-    verify(sinkRecords, validOffsets, partitions, false);
+  protected void verify(List<SinkRecord> sinkRecords, long[] validOffsets, Set<TopicPartition> partitions,
+                        String extension) throws IOException {
+    verify(sinkRecords, validOffsets, partitions, extension, false);
   }
 
   /**
@@ -229,10 +205,10 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
    * @throws IOException
    */
   protected void verify(List<SinkRecord> sinkRecords, long[] validOffsets, Set<TopicPartition> partitions,
-                        boolean skipFileListing)
+                        String extension, boolean skipFileListing)
       throws IOException {
     if (!skipFileListing) {
-      verifyFileListing(validOffsets, partitions);
+      verifyFileListing(validOffsets, partitions, extension);
     }
 
     for (TopicPartition tp : partitions) {
@@ -250,4 +226,3 @@ public class DataWriterJsonTest extends TestWithMockedS3 {
     }
   }
 }
-
